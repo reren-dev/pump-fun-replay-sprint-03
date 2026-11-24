@@ -16,11 +16,10 @@
 //     round-trip minimum. Buying before the pump, not after it, is what keeps
 //     the win rate up: chasing a coin that already ran on heavy volume mostly
 //     buys the top.
-//   * Hold at most 5 positions (in-flight buys count). Winners ride: a
-//     position is sold when it falls 15% below its peak since entry, when
-//     the coin completes (graduates, near the top of its bonding curve), or
-//     after 20000 slots held. Most new coins dump, so the trailing stop caps
-//     each loss; the few that run pay for the rest.
+//   * Hold at most 5 positions (in-flight buys count). Sell the whole
+//     position on +25% take-profit, -10% stop-loss, after 6000 slots held,
+//     or when the coin completes (graduates). Most new coins dump, so the
+//     tight stop caps each loss; the few that run pay for the rest.
 //   * A mint whose buy was just rejected is not retried for 500 slots, so a
 //     stale reserve estimate cannot spam the harness with doomed orders.
 
@@ -29,8 +28,9 @@ const BUY_SIZE_LAMPORTS = 50_000_000n; // 0.05 SOL per entry
 const MIN_BUY_LAMPORTS = 10_000_000n; // 0.01 SOL round-trip minimum
 const MIN_BUY_VOLUME_SOL = 300_000_000n; // 0.3 SOL of buy volume before entry
 const MAX_ENTRY_RISE_BPS = 1000; // enter only while within +/-10% of first sight
-const TRAIL_DROP_BPS = 1500; // sell 15% below the peak since entry
-const MAX_HOLD_SLOTS = 20000;
+const TAKE_PROFIT_BPS = 2500; // +25%
+const STOP_LOSS_BPS = 1000; // -10%
+const MAX_HOLD_SLOTS = 6000;
 const MIN_REAL_RESERVE_LAMPORTS = 2_000_000_000n; // 2 SOL of real reserves
 const RESERVE_BPS = 50; // size at most 0.5% of real reserves
 const REJECT_COOLDOWN_SLOTS = 500;
@@ -129,7 +129,6 @@ interface CoinState {
 
 interface HeldCoin {
   entryPrice: number; // lamports per token paid
-  peakPrice: number; // highest price seen since entry
   entrySlot: number;
   tokens: bigint;
 }
@@ -223,7 +222,6 @@ function applyFills(fills: Fill[]): void {
         const entryPrice = Number(quote) / Number(tokens);
         held.set(fill.mint, {
           entryPrice,
-          peakPrice: entryPrice,
           entrySlot: fill.slot,
           tokens,
         });
@@ -256,20 +254,18 @@ function onBatch(batch: Batch): Order[] {
   for (const mark of batch.marks) observeMark(mark);
   applyFills(batch.fills);
 
-  // --- Exits first: trailing stop from the peak, completion, timeout. ---
+  // --- Exits first: take-profit, stop-loss, timeout, completion. ---
   for (const [mint, rec] of held) {
     const coin = coins.get(mint);
     const price = coin ? coin.lastPrice : 0;
     let sell = false;
     if (completed.has(mint)) sell = true;
-    if (price > 0) {
-      if (price > rec.peakPrice) rec.peakPrice = price;
-      if (rec.peakPrice > 0) {
-        const dropBps = Math.floor(
-          ((rec.peakPrice - price) / rec.peakPrice) * 10000,
-        );
-        if (dropBps >= TRAIL_DROP_BPS) sell = true;
-      }
+    if (price > 0 && rec.entryPrice > 0) {
+      const moveBps = Math.floor(
+        ((price - rec.entryPrice) / rec.entryPrice) * 10000,
+      );
+      if (moveBps >= TAKE_PROFIT_BPS) sell = true;
+      if (moveBps <= -STOP_LOSS_BPS) sell = true;
     }
     if (batch.slot - rec.entrySlot >= MAX_HOLD_SLOTS) sell = true;
     if (sell && rec.tokens > 0n) {
