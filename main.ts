@@ -6,25 +6,29 @@
 // No clock, no environment, no randomness: every decision is a pure function of
 // the messages received, so two runs produce byte-identical action logs.
 //
-// Strategy (momentum scalp on new pump.fun coins):
+// Strategy (early scalp on new pump.fun coins):
 //   * Watch every mint's cumulative buy volume and price (from marks + trades).
-//   * Buy a mint once real buyers show up (>= 1.5 SOL of buy volume) and the
-//     price is up >= 5% from where we first saw it, sized at most 0.10 SOL and
-//     at most 0.9% of the mint's real SOL reserve (the harness caps buys at 1%),
-//     never below the 0.01 SOL round-trip minimum.
-//   * Hold at most 5 positions. Sell the whole position on +30% take-profit,
-//     -15% stop-loss, after 8000 slots held, or when the coin completes.
+//   * Buy a mint very early, while it is still near its first-seen price
+//     (within +/-10%) and real buyers are just showing up (>= 0.3 SOL of
+//     buy volume), sized at most 0.05 SOL and at most 0.9% of the mint's real
+//     SOL reserve (the harness caps buys at 1%), never below the 0.01 SOL
+//     round-trip minimum. Buying before the pump, not after it, is what keeps
+//     the win rate up: chasing a coin that already ran on heavy volume mostly
+//     buys the top.
+//   * Hold at most 5 positions (in-flight buys count). Sell the whole
+//     position on +25% take-profit, -10% stop-loss, after 6000 slots held,
+//     or when the coin completes (graduates).
 //   * Buys are spread across many coins, so the bot clears the 20-distinct-mint
 //     round-trip guardrail while each loss stays small.
 
 const LAMPORTS_PER_SOL = 1_000_000_000n;
-const BUY_SIZE_LAMPORTS = 100_000_000n; // 0.10 SOL per entry
+const BUY_SIZE_LAMPORTS = 50_000_000n; // 0.05 SOL per entry
 const MIN_BUY_LAMPORTS = 10_000_000n; // 0.01 SOL round-trip minimum
-const MIN_BUY_VOLUME_SOL = 1_500_000_000n; // 1.5 SOL of buy volume before entry
-const MIN_RISE_BPS = 500; // +5% vs first-seen price to enter
-const TAKE_PROFIT_BPS = 3000; // +30%
-const STOP_LOSS_BPS = 1500; // -15%
-const MAX_HOLD_SLOTS = 8000;
+const MIN_BUY_VOLUME_SOL = 300_000_000n; // 0.3 SOL of buy volume before entry
+const MAX_ENTRY_RISE_BPS = 1000; // enter only while up at most +10% from first sight
+const TAKE_PROFIT_BPS = 2500; // +25%
+const STOP_LOSS_BPS = 1000; // -10%
+const MAX_HOLD_SLOTS = 6000;
 const MAX_OPEN_POSITIONS = 5;
 const MAX_SLIPPAGE_BPS = 500; // 5%
 const MAX_ORDERS_PER_BATCH = 16;
@@ -125,6 +129,7 @@ interface HeldCoin {
 
 const coins = new Map<string, CoinState>();
 const held = new Map<string, HeldCoin>();
+const pending = new Set<string>(); // buys sent, fill not yet seen (latency 2 slots)
 const completed = new Set<string>();
 let orderCounter = 0;
 let cash = 0n;
@@ -192,6 +197,7 @@ function observeMark(mark: Mark): void {
 
 function applyFills(fills: Fill[]): void {
   for (const fill of fills) {
+    if (fill.side === "buy") pending.delete(fill.mint);
     if (fill.status !== "filled") continue;
     if (fill.side === "buy") {
       const tokens = BigInt(fill.token_amount);
@@ -256,22 +262,26 @@ function onBatch(batch: Batch): Order[] {
     }
   }
 
-  // --- Entries: momentum with real buy volume, up from first sight. ---
+  // --- Entries: early scalp — buy while still near first-seen price. ---
+  const pendingBuys = pending.size;
   const openAfterExits =
-    held.size - orders.filter((o) => o.side === "sell").length;
+    held.size + pendingBuys - orders.filter((o) => o.side === "sell").length;
   const freeSlots = MAX_OPEN_POSITIONS - openAfterExits;
   if (freeSlots > 0 && orders.length < MAX_ORDERS_PER_BATCH) {
     const candidates: { mint: string; volume: bigint }[] = [];
     for (const [mint, coin] of coins) {
       if (held.has(mint)) continue;
+      if (pending.has(mint)) continue;
       if (completed.has(mint)) continue;
       if (coin.buyVolume < MIN_BUY_VOLUME_SOL) continue;
       if (coin.firstPrice <= 0 || coin.lastPrice <= 0) continue;
       const riseBps = Math.floor(
         ((coin.lastPrice - coin.firstPrice) / coin.firstPrice) * 10000,
       );
-      if (riseBps < MIN_RISE_BPS) continue;
-      // Size: at most 0.10 SOL and at most 0.9% of real reserves (cap is 1%).
+      // Only enter early: not yet pumped (+10% max) and not already dumping.
+      if (riseBps > MAX_ENTRY_RISE_BPS) continue;
+      if (riseBps < -MAX_ENTRY_RISE_BPS) continue;
+      // Size: at most 0.05 SOL and at most 0.9% of real reserves (cap is 1%).
       const reserveCap = (coin.lastRealQuote * 90n) / 10000n;
       const size = BUY_SIZE_LAMPORTS < reserveCap
         ? BUY_SIZE_LAMPORTS
@@ -299,6 +309,7 @@ function onBatch(batch: Batch): Order[] {
         quote_lamports: size.toString(),
         max_slippage_bps: MAX_SLIPPAGE_BPS,
       });
+      pending.add(cand.mint);
       cash -= size;
     }
   }
