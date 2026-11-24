@@ -76,6 +76,7 @@ interface Fill {
   mint: string;
   side: "buy" | "sell";
   status: "filled" | "rejected" | "failed";
+  reason: string | null;
   decided_slot: number;
   slot: number;
   quote_lamports: U64;
@@ -130,6 +131,8 @@ interface HeldCoin {
 const coins = new Map<string, CoinState>();
 const held = new Map<string, HeldCoin>();
 const pending = new Set<string>(); // buys sent, fill not yet seen (latency 2 slots)
+const rejectReasons = new Map<string, number>();
+let sentOrders = 0;
 const completed = new Set<string>();
 let orderCounter = 0;
 let cash = 0n;
@@ -198,6 +201,10 @@ function observeMark(mark: Mark): void {
 function applyFills(fills: Fill[]): void {
   for (const fill of fills) {
     if (fill.side === "buy") pending.delete(fill.mint);
+    if (fill.status === "rejected" || fill.status === "failed") {
+      const key = `${fill.status}:${fill.reason ?? "?"}`;
+      rejectReasons.set(key, (rejectReasons.get(key) ?? 0) + 1);
+    }
     if (fill.status !== "filled") continue;
     if (fill.side === "buy") {
       const tokens = BigInt(fill.token_amount);
@@ -336,12 +343,15 @@ async function main(): Promise<void> {
         } else if (msg.type === "batch") {
           const batch = msg as Batch;
           const orders = onBatch(batch);
+          sentOrders += orders.length;
           process.stdout.write(
             JSON.stringify({ type: "reply", seq: batch.seq, orders }) +
               "\n",
           );
         } else if (msg.type === "done") {
-          console.error(`done seq=${msg.seq} open=${held.size}`);
+          console.error(
+            `done seq=${msg.seq} open=${held.size} sent=${sentOrders} rejects=${JSON.stringify([...rejectReasons])}`,
+          );
           process.exit(0);
         }
       }
